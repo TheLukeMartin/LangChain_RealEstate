@@ -1,0 +1,160 @@
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+from langchain.schema import Document
+import pandas as pd
+import csv
+from langchain.chat_models import ChatOpenAI
+from langchain import LLMChain, PromptTemplate
+
+def load_property_listings():
+    df = pd.read_csv("property_listings.csv")
+    df['id'] = df.index.astype(str)
+    df['combined_description'] = df['Description'] + " " + df['Neighborhood Description']
+    return df
+
+def get_embbedings(df):
+    # Initialise the embeddings model
+    embeddings = OpenAIEmbeddings()
+
+    embedding_vectors = embeddings.embed_documents(df['combined_description'].tolist())
+    df['embedding'] = embedding_vectors
+    return df
+def store_embeddings(df):
+    
+    documents = []
+    for idx, row in df.iterrows():
+        doc = Document(
+            page_content=row['combined_description'],
+            metadata={
+                "Neighborhood": row["Neighborhood"],
+                "Price": row["Price"],
+                "Bedrooms": row["Bedrooms"],
+                "Bathrooms": row["Bathrooms"],
+                "House Size": row["House Size"]
+            }
+        )
+        documents.append(doc)
+    # Define the persist directory
+    persist_directory = "./chroma_db"
+    embeddings = OpenAIEmbeddings()
+
+    # Create the Chroma vectorstore with texts and metadata
+    db = Chroma.from_documents(documents=documents, embedding=embeddings, persist_directory=persist_directory)
+    
+    return db
+    
+def get_prompt_template():
+    prompt_template = """
+                You are an expert AI real estate agent. Based on the buyer's preferences, provide a personalized summary to buyer for each property.
+
+                Buyer's Preferences:
+
+                Neighborhood: {Neighborhood}
+                Price: {Price}
+                Bedrooms: {Bedrooms}
+                Bathrooms: {Bathrooms}
+                House Size: {House_Size}
+                List of Properties:
+                {properties}
+                Task: Based on the buyer's preferences, provide a personalized summary for each property, highlighting how well it matches their criteria and any unique features that may appeal to them. Do not change the original details of the property 
+                if you didnt find any property matching their preferences suggest them something similar and tell them how they are also better. If something similar is also not found say didnt find any properties as per their requirement.
+                Display all details of the property at first and then give your personalised summary to the buyer"""
+    return prompt_template
+
+def get_suitable_property(db, description):
+    results = db.similarity_search_with_score(description, k=3)
+    
+    properties = []
+    # Parsing the metadata
+    for i in range(len(results[0])):
+        property_details = parse_metadata(results[0][0])
+        properties.append(property_details)
+    return properties
+
+# Custom parser function to extract metadata
+def parse_metadata(doc):
+    if doc.metadata:
+        metadata = doc.metadata
+        page_content = doc.page_content
+        parsed_data = {
+            "Bathrooms": metadata.get("Bathrooms"),
+            "Bedrooms": metadata.get("Bedrooms"),
+            "House Size": metadata.get("House Size"),
+            "Neighborhood": metadata.get("Neighborhood"),
+            "Price": metadata.get("Price"),
+            "Description": page_content
+        }
+    return parsed_data
+
+def get_personalised_listings(bathrooms, bedrooms, house_size, neighborhood, price, description, properties):
+ 
+    prompt_template = PromptTemplate(
+    input_variables=["Neighborhood", "Price", "Bedrooms", "Bathrooms", "House_Size", "properties"],
+    template=get_prompt_template())
+    
+    buyer_preferences = {
+    "Neighborhood": "No preference",
+    "Price": "$1,000,000 - $1,500,0000",
+    "Bedrooms": "2",
+    "Bathrooms": "2",
+    "House_Size": "1,000 - 4,000 sqft",
+    "properties": properties}
+    
+    # Initialize the OpenAI LLM
+    llm = ChatOpenAI(model=model, temperature=1, max_tokens = 4000)
+
+    # Create the LLMChain
+    chain = LLMChain(llm=llm, prompt=prompt_template)
+
+    # Generate the listings
+    response = chain.run(buyer_preferences)
+
+    return response
+
+import gradio as gr
+
+# Define the function that the interface will use
+def real_estate_agent(bathrooms, bedrooms, house_size, neighborhood, price, description):
+    try:
+        # Load property listings
+        property_list_df = load_property_listings()
+        
+        # Get embeddings for the property listings
+        property_list_df = get_embbedings(property_list_df)
+        
+        # Store embeddings in the database
+        db = store_embeddings(property_list_df)
+        
+        # Get suitable properties based on the description
+        properties = get_suitable_property(db, description)
+        
+        # Generate personalized listings based on user input and suitable properties
+        personalise_output = get_personalised_listings(bathrooms, bedrooms, house_size, neighborhood, price, description, properties)
+        
+        return personalise_output
+    except Exception as e:
+        return f"An error occurred: {e}"
+
+# Create the Gradio interface
+demo = gr.Interface(
+    fn=real_estate_agent,
+    inputs=[
+        gr.Textbox(lines=1, placeholder="Enter number of bathrooms...", label="Bathrooms"),
+        gr.Textbox(lines=1, placeholder="Enter number of bedrooms...", label="Bedrooms"),
+        gr.Textbox(lines=1, placeholder="Enter house size...", label="House Size"),
+        gr.Textbox(lines=1, placeholder="Enter neighborhood...", label="Neighborhood"),
+        gr.Textbox(lines=1, placeholder="Enter price...", label="Price"),
+        gr.Textbox(lines=3, placeholder="Enter description...", label="Description")
+    ],
+    outputs="text",
+    title="AI Real Estate Agent",
+    description="Provide property details and get insights from the AI real estate agent. If nothing is selected, it will give 'no preference'.",
+    examples=[
+        ["2", "3", "1500 sqft", "Downtown", "$300,000", "Looking for a cozy family home in a vibrant neighborhood."],
+        ["4", "5", "3500 sqft", "Suburbs", "$800,000", "Spacious house with a large backyard and modern amenities."]
+    ]
+)
+
+# Launch the app with a shareable URL
+demo.launch(share=True)
